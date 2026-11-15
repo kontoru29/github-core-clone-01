@@ -1,3 +1,9 @@
+// This file launches the forge service for the trial run.
+// The real request handling is implemented in the neighbouring source files.
+// Startup asks the operating system for any free port, then lets the test
+// harness know where the service can be reached.
+// Afterwards this process simply waits until the harness signals that the
+// trial has finished, then shuts the service down and leaves.
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.

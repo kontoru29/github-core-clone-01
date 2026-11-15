@@ -244,7 +244,11 @@ export function handleUploadPack(
     sendJson(res, 400, { message: 'Bad Request' });
     return;
   }
-  const lines = pktTextLines(body);
+  // Lines from the items just decoded (pktTextLines would decode again).
+  const lines: string[] = [];
+  for (const it of items) {
+    if (it.kind === 'data') lines.push(it.data.toString('utf8').replace(/\n$/, ''));
+  }
   const first = lines[0] ?? '';
   const isV2 = req.headers['git-protocol'] !== undefined && String(req.headers['git-protocol']).includes('version=2');
   try {

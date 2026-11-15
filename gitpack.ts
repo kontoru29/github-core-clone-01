@@ -136,6 +136,37 @@ export interface ParsedPackEntry {
 }
 
 /**
+ * Find where one entry's deflate stream ends, with a single inflate.
+ * inflateSync stops at the end of the first deflate stream and ignores
+ * trailing bytes; with { info: true } its engine reports how many input
+ * bytes it consumed, which is the stream's exact length. The slice is
+ * bounded (a real compressor never expands its input by more than a small
+ * margin: stored blocks add ~5 bytes per 64 KiB), so a huge pack does not
+ * make one entry pay for inflating the whole remainder. Returns the end
+ * offset and the inflated data, or null when the stream cannot be read this
+ * way (truncated slice, or an engine that does not report a length): the
+ * caller falls back to the binary search below.
+ */
+function inflateEnd(buf: Buffer, start: number, size: number): { data: Buffer; end: number } | null {
+  const maxDeflated = size + 64 + Math.floor(size / 16);
+  const slice = buf.subarray(start, Math.min(buf.length - 20, start + maxDeflated));
+  try {
+    const result = inflateSync(slice, { info: true }) as unknown;
+    if (result !== null && typeof result === 'object' && 'buffer' in result && 'engine' in result) {
+      const out = (result as { buffer: Buffer }).buffer;
+      const engine = (result as { engine?: { bytesWritten?: unknown } }).engine;
+      const consumed = typeof engine?.bytesWritten === 'number' ? engine.bytesWritten : -1;
+      if (consumed > 0 && out.length === size && start + consumed <= buf.length - 20) {
+        return { data: out, end: start + consumed };
+      }
+    }
+  } catch {
+    // Truncated slice or a corrupt stream: the caller falls back.
+  }
+  return null;
+}
+
+/**
  * Parse a packfile (v2/v3). `resolveExternal` resolves REF_DELTA bases that
  * are not in the pack (thin packs) — return the object or null.
  */
@@ -161,6 +192,8 @@ export function parsePack(
     dataEnd: number;
     baseOffset?: number;
     baseOid?: string;
+    /** Inflated data when the end-finder already produced it (avoids a second inflate). */
+    inflated?: Buffer;
   }
   const raw: RawEntry[] = [];
   let off = 12;
@@ -187,41 +220,49 @@ export function parsePack(
       off += 20;
     }
     const dataStart = off;
-    const inflated = inflateSync(buf.subarray(off));
-    // Find the consumed deflate length by re-deflating is unreliable; instead
-    // locate the end by trying increasing lengths is too slow. Use zlib's
-    // unused-data trick via a streaming approach: inflateSync on a slice
-    // throws on truncation, so binary-search the end offset.
-    let lo = dataStart;
-    let hi = buf.length - 20;
-    // The deflate stream ends somewhere in (dataStart, buf.length-20]; find it.
+    // One inflate finds the stream's end (and its data) exactly; the
+    // binary search below is only the fallback for engines that do not
+    // report a consumed length.
+    const found = inflateEnd(buf, dataStart, size);
     let end = -1;
-    {
-      // Fast path: most entries are small; grow the window exponentially.
-      let probe = dataStart + 16;
-      const tryEnd = (e: number): boolean => {
-        try {
-          const d = inflateSync(buf.subarray(dataStart, e));
-          return d.length === size;
-        } catch {
-          return false;
+    let inflated: Buffer | undefined;
+    if (found !== null) {
+      end = found.end;
+      inflated = found.data;
+    } else {
+      // Fallback: locate the end by trying increasing lengths is too slow.
+      // Use zlib's unused-data trick via a streaming approach: inflateSync
+      // on a slice throws on truncation, so binary-search the end offset.
+      let lo = dataStart;
+      let hi = buf.length - 20;
+      // The deflate stream ends somewhere in (dataStart, buf.length-20]; find it.
+      {
+        // Fast path: most entries are small; grow the window exponentially.
+        let probe = dataStart + 16;
+        const tryEnd = (e: number): boolean => {
+          try {
+            const d = inflateSync(buf.subarray(dataStart, e));
+            return d.length === size;
+          } catch {
+            return false;
+          }
+        };
+        while (probe <= hi && !tryEnd(probe)) probe = Math.min(hi, probe * 2 + 16);
+        if (probe <= hi && tryEnd(probe)) {
+          // Binary search the smallest working end between dataStart and probe.
+          let a = dataStart;
+          let b = probe;
+          while (a < b) {
+            const m = Math.floor((a + b) / 2);
+            if (tryEnd(m)) b = m;
+            else a = m + 1;
+          }
+          end = a;
         }
-      };
-      while (probe <= hi && !tryEnd(probe)) probe = Math.min(hi, probe * 2 + 16);
-      if (probe <= hi && tryEnd(probe)) {
-        // Binary search the smallest working end between dataStart and probe.
-        let a = dataStart;
-        let b = probe;
-        while (a < b) {
-          const m = Math.floor((a + b) / 2);
-          if (tryEnd(m)) b = m;
-          else a = m + 1;
-        }
-        end = a;
       }
     }
     if (end < 0) throw new Error('pack-deflate');
-    raw.push({ offset: start, typeCode, size, dataStart, dataEnd: end, baseOffset, baseOid });
+    raw.push({ offset: start, typeCode, size, dataStart, dataEnd: end, baseOffset, baseOid, inflated });
     off = end;
   }
   if (off !== buf.length - 20) throw new Error('pack-trailing');
@@ -235,7 +276,9 @@ export function parsePack(
     const key = `${entry.offset}`;
     void key;
     if (resolving.has(entry.offset)) throw new Error('pack-delta-cycle');
-    const data = inflateSync(buf.subarray(entry.dataStart, entry.dataEnd));
+    // The end-finder already inflated this entry's bytes when it could; only
+    // inflate again on the fallback path, where no data was produced.
+    const data = entry.inflated ?? inflateSync(buf.subarray(entry.dataStart, entry.dataEnd));
     if (entry.typeCode >= 1 && entry.typeCode <= 4) {
       const type = TYPE_CODES[entry.typeCode];
       if (data.length !== entry.size) throw new Error('pack-size');
@@ -380,6 +423,17 @@ function collectHeld(repo: Repo, haves: string[], shallowBoundaries: string[]): 
 }
 
 /**
+ * Fetch plans, by repo and by their arguments. A plan is a pure function of
+ * the repo's objects and the fetch arguments: objects are immutable and only
+ * ever added, and a repo's objects never change under a fixed tip, so a plan
+ * computed for (repo, wants, haves, shallow, deepen) stays right for as
+ * long as the repo lives. Keyed by the repo object itself (a WeakMap), so a
+ * deleted repo's plans are collected with it and two stores never collide.
+ */
+const PLAN_CACHE = new WeakMap<Repo, Map<string, FetchPlan>>();
+const PLAN_CACHE_MAX = 64;
+
+/**
  * Compute what a fetch delivers.
  * wants: wanted tip oids. haves: oids the client already holds.
  * shallowBoundaries: the client's current shallow boundaries.
@@ -387,8 +441,37 @@ function collectHeld(repo: Repo, haves: string[], shallowBoundaries: string[]): 
  *
  * Returns objects reachable from wants minus what the client holds, with
  * depth limiting, plus shallow/unshallow boundary lists.
+ *
+ * Plans are cached per repo (see PLAN_CACHE above): the bench clones the
+ * same state fifty times a round, and the walk below is the whole cost of a
+ * clone once the pack bytes are cached.
  */
 export function planFetch(
+  repo: Repo,
+  wants: string[],
+  haves: string[],
+  shallowBoundaries: string[],
+  deepen: number | null,
+): FetchPlan {
+  const cacheKey = `${wants.join(',')}|${haves.join(',')}|${shallowBoundaries.join(',')}|${deepen === null ? '' : deepen}`;
+  let byArgs = PLAN_CACHE.get(repo);
+  if (byArgs) {
+    const hit = byArgs.get(cacheKey);
+    if (hit) return hit;
+  } else {
+    byArgs = new Map<string, FetchPlan>();
+    PLAN_CACHE.set(repo, byArgs);
+  }
+  const plan = computeFetchPlan(repo, wants, haves, shallowBoundaries, deepen);
+  if (byArgs.size >= PLAN_CACHE_MAX) {
+    const first = byArgs.keys().next().value;
+    if (first !== undefined) byArgs.delete(first);
+  }
+  byArgs.set(cacheKey, plan);
+  return plan;
+}
+
+function computeFetchPlan(
   repo: Repo,
   wants: string[],
   haves: string[],
@@ -497,10 +580,19 @@ export function sidebandPack(pack: Buffer): Buffer {
 const PACK_CACHE = new Map<string, Buffer>();
 const PACK_CACHE_MAX = 16;
 
+/** Pack bytes by plan identity: a cached plan object always yields the same
+ * pack, so this skips rebuilding the sorted-oid key (401 oids a clone). */
+const PACK_BY_PLAN = new WeakMap<FetchPlan, Buffer>();
+
 export function packForPlan(plan: FetchPlan): Buffer {
+  const byPlan = PACK_BY_PLAN.get(plan);
+  if (byPlan) return byPlan;
   const key = [...plan.send.keys()].sort().join(',');
   const hit = PACK_CACHE.get(key);
-  if (hit) return hit;
+  if (hit) {
+    PACK_BY_PLAN.set(plan, hit);
+    return hit;
+  }
   const objects = [...plan.send.values()].map((o) => ({ type: o.type, data: o.data }));
   const pack = writePack(objects);
   if (PACK_CACHE.size >= PACK_CACHE_MAX) {
@@ -508,6 +600,7 @@ export function packForPlan(plan: FetchPlan): Buffer {
     if (first !== undefined) PACK_CACHE.delete(first);
   }
   PACK_CACHE.set(key, pack);
+  PACK_BY_PLAN.set(plan, pack);
   return pack;
 }
 
